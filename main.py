@@ -1,18 +1,18 @@
 import os
 import json
 import asyncio
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
 from groq import Groq
 from dotenv import load_dotenv
 
-# Carrega as variáveis de ambiente (Railway)
+# Carrega variáveis de ambiente
 load_dotenv()
 
 app = FastAPI()
 
-# Permissões de CORS (para a extensão conseguir conectar)
+# Configuração de CORS (Permite conexão da extensão)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,86 +21,84 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuração das Chaves de API
+# Chaves de API
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Cliente da Inteligência Artificial (Groq)
+# Validação simples
+if not DEEPGRAM_API_KEY or not GROQ_API_KEY:
+    print("❌ ERRO: Chaves de API não configuradas no Railway!")
+
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 async def analyze_sales_context(text_chunk):
     """
-    Função que envia o texto para a IA e pede uma análise completa
-    retornando um JSON estruturado com Sentimento, DISC e Dicas.
+    Analisa o texto com Llama 3 para extrair:
+    - Sentimento (0-100)
+    - Perfil DISC
+    - Checklist (Temas falados)
+    - Dicas (Advice)
     """
-    # Ignora frases muito curtas para economizar e evitar alucinações
-    if len(text_chunk.split()) < 4: 
-        return None
-
-    prompt = f"""
-    Você é um Analista de Vendas IA em tempo real.
-    Analise a frase do cliente: "{text_chunk}"
+    # Ignora frases muito curtas
+    if len(text_chunk.split()) < 4: return None
     
-    Retorne APENAS um JSON com este formato estrito:
+    prompt = f"""
+    Analise a frase de vendas: "{text_chunk}"
+    Retorne JSON estrito:
     {{
-        "sentiment": (inteiro de 0 a 100, onde 0=irritado/frio, 100=empolgado/quente),
-        "disc": (string: "D" para Dominante, "I" para Influente, "S" para Estável, ou "C" para Conforme),
-        "topics": (lista de strings com os temas falados, ex: ["preco", "prazo", "escopo", "geral"]),
-        "advice": (string curta com uma dica de venda se houver objeção ou dúvida, ou null se estiver tudo bem)
+        "sentiment": (inteiro 0-100, 0=ruim 100=otimo),
+        "disc": ("D", "I", "S", "C" ou "--"),
+        "topics": (lista de strings: ["preco", "prazo", "escopo", "geral"]),
+        "advice": (string com dica curta de venda ou null)
     }}
     """
-    
     try:
         chat = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             temperature=0.2,
             max_tokens=150,
-            response_format={"type": "json_object"} # Garante que volta JSON puro
+            response_format={"type": "json_object"}
         )
         return json.loads(chat.choices[0].message.content)
     except Exception as e:
-        print(f"Erro na IA: {e}")
+        print(f"Erro Groq: {e}")
         return None
 
 @app.websocket("/listen")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("🔌 Cliente conectado (Extensão V3.1)")
+    print("🟢 (WebSocket) Extensão Conectada")
 
-    # Estado da Checklist (Reinicia a cada nova conexão)
-    checklist_state = {
-        "preco": False,
-        "prazo": False,
-        "escopo": False
-    }
+    # Estado inicial da checklist
+    checklist_state = {"preco": False, "prazo": False, "escopo": False}
 
     try:
-        # Conecta na Deepgram
+        # Inicia cliente Deepgram
         deepgram = DeepgramClient(DEEPGRAM_API_KEY)
-        
-        # Função chamada toda vez que a Deepgram manda um texto
+        dg_connection = deepgram.listen.live.v("1")
+
+        # --- EVENTOS DEEPGRAM ---
         async def on_message(result, **kwargs):
             sentence = result.channel.alternatives[0].transcript
-            
             if len(sentence) > 0:
                 is_final = result.is_final
                 
-                # 1. Envia a transcrição instantânea para a tela (Legenda)
+                # 1. Envia Transcrição Imediata
                 await websocket.send_json({"type": "transcript", "text": sentence})
                 
-                # 2. Se a frase foi finalizada, chama a Inteligência
+                # 2. Se a frase acabou, analisa com IA
                 if is_final:
+                    print(f"📝 Frase detectada: {sentence}")
                     analysis = await analyze_sales_context(sentence)
                     
                     if analysis:
-                        # Atualiza a Checklist se o tema foi citado
+                        # Atualiza Checklist
                         topics = analysis.get("topics", [])
-                        if "preco" in topics: checklist_state["preco"] = True
-                        if "prazo" in topics: checklist_state["prazo"] = True
-                        if "escopo" in topics: checklist_state["escopo"] = True
+                        for t in ["preco", "prazo", "escopo"]:
+                            if t in topics: checklist_state[t] = True
                         
-                        # Monta o pacote de dados para o Frontend
+                        # Envia Análise
                         payload = {
                             "type": "analysis",
                             "sentiment": analysis.get("sentiment", 50),
@@ -108,35 +106,50 @@ async def websocket_endpoint(websocket: WebSocket):
                             "advice": analysis.get("advice"),
                             "checklist": checklist_state
                         }
-                        
-                        # Envia para a extensão atualizar os gráficos
                         await websocket.send_json(payload)
-
-        # Configurações da Deepgram Live
-        dg_connection = deepgram.listen.live.v("1")
-        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
         
+        async def on_error(error, **kwargs):
+            print(f"❌ Erro Deepgram: {error}")
+
+        # Conecta os eventos
+        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+        dg_connection.on(LiveTranscriptionEvents.Error, on_error)
+
+        # CONFIGURAÇÃO DE ÁUDIO (A Correção está aqui)
+        # Removemos 'encoding' e 'sample_rate' para deixar a Deepgram 
+        # detectar automaticamente o formato WebM do Chrome.
         options = LiveOptions(
-            model="nova-2", 
-            language="pt-BR", 
-            smart_format=True, 
-            interim_results=True
+            model="nova-2",
+            language="pt-BR",
+            smart_format=True,
+            interim_results=True,
+            # encoding="opus" <--- REMOVIDO: Isso causava o erro 1011
         )
 
         if dg_connection.start(options) is False:
-            print("Erro ao conectar na Deepgram")
+            print("❌ Falha ao iniciar conexão com Deepgram")
+            await websocket.close()
             return
 
-        # Loop principal: Recebe áudio do WebSocket e joga na Deepgram
+        print("🚀 Deepgram Iniciada e Ouvindo...")
+
+        # --- LOOP DE RECEBIMENTO DE ÁUDIO ---
         while True:
-            data = await websocket.receive_bytes()
-            dg_connection.send(data)
+            try:
+                # Recebe áudio da extensão e repassa para Deepgram
+                data = await websocket.receive_bytes()
+                dg_connection.send(data)
+            except WebSocketDisconnect:
+                print("🔴 Extensão desconectou")
+                break
+            except Exception as e:
+                print(f"❌ Erro no loop de áudio: {e}")
+                break
 
     except Exception as e:
-        print(f"Erro WebSocket: {e}")
+        print(f"❌ Erro Geral: {e}")
     finally:
-        # Limpeza ao desconectar
+        # Limpeza
         if 'dg_connection' in locals():
             dg_connection.finish()
-        await websocket.close()
-        print("🔌 Cliente desconectado")
+        print("🏁 Conexão Encerrada")
